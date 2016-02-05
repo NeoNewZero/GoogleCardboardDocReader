@@ -1,0 +1,3 @@
+/home/moondawg/Android/cardboard-java/CardboardSample/build/intermediates/classes/debug
+/home/moondawg/Android/cardboard-java/CardboardSample/build/intermediates/pre-dexed/debug/libprotobuf-java-2.3-nano-c33cfde13e15a0bad8cd5bd44255274f0610a7d4.jar
+/home/moondawg/Android/cardboard-java/CardboardSample/build/intermediates/pre-dexed/debug/cardboard-97b430e823b91657e8c9d81db57c875d9867aa7a.jar
