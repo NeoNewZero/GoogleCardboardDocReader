@@ -1,0 +1,438 @@
+ 
+package com.google.vrtoolkit.cardboard.samples.treasurehunt;
+
+/**
+ * Created by Amr on 4/15/15.
+ */
+
+import android.app.Activity;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Color;
+import android.graphics.ImageFormat;
+import android.graphics.SurfaceTexture;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CameraMetadata;
+import android.hardware.camera2.CaptureFailure;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
+import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.Image;
+import android.media.ImageReader;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.util.Log;
+import android.util.Size;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.Queue;
+
+/*
+ * The intent of this class is to package away all the
+ * nuisances of camera management on Android. We really only
+ * need basic camera functionality, so this class rolls down
+ * the essential pipeline.
+ */
+public class CameraPipeline {
+
+    private int maxImages;
+    private Handler mBackgroundHandler;
+    private HandlerThread mBackgroundThread;
+    private ImageReader reader;
+    private MainActivity activity;
+
+    private int[][] prevColors;
+    private boolean trackingLeft = false;
+    private boolean trackingRight = false;
+
+    //private ArrayList<File> fileArray;
+    //private int numPictures = 0;
+
+    private CameraManager manager;
+    private String mCameraId;
+    private CameraDevice mDevice;
+    private CameraCaptureSession mSession;
+    private CaptureRequest.Builder mBuilder;
+    private CaptureRequest mRequest;
+
+    private int numImagesInReader=0;
+    private int numPictures = 0;
+    private int xPos = -1;
+
+    public boolean needUpdateRight = false;
+    public boolean needUpdateLeft = false;
+
+    public CameraPipeline(CameraManager manager, int maxImages, MainActivity activity){
+        this.manager   = manager;
+        this.maxImages = maxImages;
+        this.activity  = activity;
+        
+        //mFile1 = new File(activity.getExternalFilesDir(null), "pic.jpg");
+        //mFile2 = new File(activity.getExternalFilesDir(null), "pic2.jpg");
+        //fileArray = new ArrayList<File>();
+        //onResume();
+    }
+
+    private SurfaceTexture.OnFrameAvailableListener frameAvailableListener = new SurfaceTexture.OnFrameAvailableListener() {
+        @Override
+        public void onFrameAvailable(SurfaceTexture surfaceTexture) {
+
+        }
+    };
+
+    private CameraDevice.StateCallback mCamDevStateCb = new CameraDevice.StateCallback(){
+
+        @Override
+        public void onOpened(CameraDevice camera) {
+            //semaphore.release
+            mDevice = camera;
+            try {
+                mBuilder = mDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                mBuilder.addTarget(reader.getSurface());
+                mDevice.createCaptureSession(Arrays.asList(reader.getSurface()),mCamCapSeshStateCb,null);
+            } catch (CameraAccessException e) {
+                e.printStackTrace();
+            }
+        }
+
+        @Override
+        public void onDisconnected(CameraDevice camera) {
+            //semaphore.release
+            mDevice.close();
+            mDevice = null;
+        }
+
+        @Override
+        public void onError(CameraDevice camera, int error) {
+            //semaphore.release
+            mDevice.close();
+            mDevice = null;
+        }
+    };
+
+    private CameraCaptureSession.StateCallback mCamCapSeshStateCb = new CameraCaptureSession.StateCallback() {
+        @Override
+        public void onConfigured(CameraCaptureSession session) {
+            if(mDevice == null)
+                return;
+
+            mSession = session;
+            mBuilder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF);
+            mBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+            mBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH);
+            mRequest = mBuilder.build();
+            try {
+                mSession.setRepeatingRequest(mRequest,mCamCapSeshCapCb,mBackgroundHandler);
+            } catch (CameraAccessException e) {
+                e.printStackTrace();
+            }
+        }
+
+        @Override
+        public void onConfigureFailed(CameraCaptureSession session) {
+            // show Toast. Needs activity instance
+        }
+    };
+
+    private CameraCaptureSession.CaptureCallback mCamCapSeshCapCb = new CameraCaptureSession.CaptureCallback() {
+    };
+
+    private ImageReader.OnImageAvailableListener imReaderListener = new ImageReader.OnImageAvailableListener() {
+        @Override
+        public void onImageAvailable(ImageReader reader) {
+            try {
+                if(numImagesInReader < maxImages) {
+                    numImagesInReader++;
+                    mBackgroundHandler.post(new VideoProcessor(reader.acquireNextImage()));
+                }
+            } catch(IllegalStateException e){
+                e.printStackTrace();
+            }
+        }
+    };
+
+
+    private void startBackgroundThread(){
+        mBackgroundThread = new HandlerThread("CameraBackground");
+        mBackgroundThread.start();
+        mBackgroundHandler = new Handler(mBackgroundThread.getLooper());
+    }
+
+    private void stopBackgroundThread() {
+        mBackgroundThread.quitSafely();
+        try {
+            mBackgroundThread.join();
+            mBackgroundThread = null;
+            mBackgroundHandler = null;
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void setupImageReader() throws CameraAccessException {
+        CameraCharacteristics stats = manager.getCameraCharacteristics(mCameraId);
+        StreamConfigurationMap map = stats.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        Size smallSize = new Size(640,480);
+        Size[] sizesOfCameraImages = map.getOutputSizes(ImageFormat.YUV_420_888);
+        int smallRes = 480*640;
+        for(int i = 0; i < sizesOfCameraImages.length-1 && smallSize.getHeight()*smallSize.getWidth() > smallRes; i++)
+                smallSize = sizesOfCameraImages[i];
+        reader = ImageReader.newInstance(smallSize.getWidth(), smallSize.getHeight(),ImageFormat.YUV_420_888, maxImages);
+        reader.setOnImageAvailableListener(imReaderListener, mBackgroundHandler);
+    }
+
+    private void findFrontCamera() {
+        try {
+
+            for (String cameraId : manager.getCameraIdList())
+            {
+                CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
+
+                if (characteristics.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK)
+                    mCameraId = cameraId;
+
+            }
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
+
+
+    private class VideoProcessor implements Runnable{
+
+        private int width;
+        private int height;
+        private byte[] currBytesY;
+        //private byte[] currBytesV;
+        //private byte[] currBytesU;
+        private float fraction = 0.20f;
+        private int widthSlice;
+        private int stepWidth;
+        private float thresholdToTrack = 100.0f;
+        private float thresholdForNoise = 30.0f;
+        private float stepFraction = fraction/2;
+
+
+        public VideoProcessor(Image currFrame){
+            width = currFrame.getWidth();
+            height = currFrame.getHeight();
+            widthSlice = (int) (width * fraction);
+            stepWidth = (int) (width * stepFraction);
+
+            ByteBuffer bufferY = currFrame.getPlanes()[0].getBuffer();
+            byte[] bytesY = new byte[bufferY.remaining()];
+            bufferY.get(bytesY);
+            currBytesY = new byte[bytesY.length];
+            for(int i = 0; i < bytesY.length; i++)
+                currBytesY[i] = bytesY[i];
+
+            currFrame.close();
+            numImagesInReader--;
+        }
+
+        @Override
+        public void run(){
+            int[][] colorsCurr = new int[height][width];
+            for(int y = 0; y < height; y++){
+                for(int x = 0; x < width; x++){
+                    int Y = currBytesY[y * width + x];
+                    if(Y < 0)
+                        Y = 256 - Math.abs(Y);
+                    colorsCurr[y][x] = Y;
+                }
+            }
+            if(numPictures > 2){
+                float rsigma = calcVariance(colorsCurr,width-widthSlice-1,width,height,width);
+                float lsigma = calcVariance(colorsCurr,0,widthSlice,height,width);
+                    //Log.e("RUNNABLE", "leftSigma: " + lsigma + ", rightSigma: " + rsigma + ", trackingLeft: " + trackingLeft + ", trackingRight: " + trackingRight);
+
+                /*if(rsigma > thresholdToTrack && lsigma > thresholdToTrack){
+                    trackingRight = false;
+                    trackingLeft = false;
+                }*/
+                if(rsigma < thresholdForNoise && lsigma < thresholdForNoise)
+                {
+                    trackingLeft = false;
+                    trackingRight = false;
+                }
+                if(rsigma > thresholdToTrack && lsigma < thresholdForNoise && !trackingRight && !trackingLeft){
+                    trackingRight = true;
+                }
+                else if(lsigma > thresholdToTrack && rsigma < thresholdForNoise && !trackingRight && !trackingLeft){
+                    trackingLeft = true;
+                }
+                else if(rsigma > thresholdToTrack && lsigma < thresholdForNoise && trackingRight && !trackingLeft){
+                    trackingRight = true;
+                }
+                else if(lsigma > thresholdToTrack && rsigma < thresholdForNoise && !trackingRight && trackingLeft){
+                    trackingLeft = true;
+                }
+                else if(lsigma > thresholdToTrack && trackingRight && !trackingLeft){
+                    activity.changeTextRight();
+                    trackingRight = false;
+                }
+                else if(rsigma > thresholdToTrack && !trackingRight && trackingLeft){
+                    activity.changeTextLeft();
+                    trackingLeft = false;
+                }
+
+            }
+            prevColors = new int[height][width];
+            for(int y = 0; y < height; y++){
+                for(int x = 0; x < width; x++){
+                     prevColors[y][x] = colorsCurr[y][x];
+                }
+            }
+            numPictures++;
+            Log.d("Process:", "Completed run");
+        }
+    }
+
+    private float calcVariance(int[][] currColors, int start, int end, int height, int width){
+        // Compute the residual
+        int[][] res = new int[height][(end-start)];
+        for(int r = 0; r < height; r++){
+            for(int c = start; c < end; c++){
+                res[r][c - start] = currColors[r][c] - prevColors[r][c];
+            }
+        }
+
+        // Map residual into grayscale
+        for(int r = 0; r < height; r++){
+            for(int c = 0; c < end-start;c++){
+                res[r][c] = res[r][c]+256;
+                res[r][c] = res[r][c]/2;
+            }
+        }
+
+        // Find right histogram of residuals
+        float[] hist = new float[256];
+        for(int r = 0; r < height; r++) {
+            for (int c = 0; c < end - start; c++) {
+                hist[res[r][c]]++;
+            }
+        }
+
+        // Compute variance of histogram of residual
+        float sigma = 0;
+        float mu = 0;
+        for(int n = 0; n < 256; n++)
+            hist[n] = hist[n]/(height*(end-start));
+        for(int n = 0; n < 256; n++)
+            mu = mu + n*hist[n];
+        for(int n = 0; n < 256; n++)
+            sigma = sigma + n*n*hist[n];
+        sigma = sigma - mu*mu;
+
+        return sigma;
+
+    }
+
+    public void onPause(){
+        try {
+            mSession.stopRepeating();
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+        mSession.close();
+        mDevice.close();
+        reader.close();
+        stopBackgroundThread();
+    }
+
+    public void onResume(){
+        this.findFrontCamera();
+        this.startBackgroundThread();
+        try {
+            this.setupImageReader();
+            manager.openCamera(mCameraId,mCamDevStateCb,mBackgroundHandler);
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+    }
+
+            /*ByteBuffer bufferU = currFrame.getPlanes()[1].getBuffer();
+            byte[] bytesU = new byte[bufferU.remaining()];
+            bufferU.get(bytesU);
+            currBytesU = new byte[bytesU.length];
+            for(int i = 0; i < bytesU.length; i++)
+                currBytesU[i] = bytesU[i];
+
+            ByteBuffer bufferV = currFrame.getPlanes()[2].getBuffer();
+            byte[] bytesV = new byte[bufferV.remaining()];
+            bufferV.get(bytesV);
+            currBytesV = new byte[bytesV.length];
+            for(int i = 0; i < bytesV.length; i++)
+                currBytesV[i] = bytesV[i];*/
+
+                       /* int U = currBytesU[(y/2) * (width/2) + (x/2)];
+                    if(U < 0)
+                        U = 256 - Math.abs(U);
+                    int V = currBytesV[(y/2) * (width/2) + (x/2)];
+                    if(V < 0)
+                        V = 256 - Math.abs(V);
+                    int A = 255;
+                    int R = Math.max(0, Math.min(255, (int) (Y + (1.370705 * (V-128)))));
+                    int G = Math.max(0, Math.min(255, (int) (Y - (0.698001 * (V-128)) - (0.337633 * (U-128)))));
+                    int B = Math.max(0, Math.min(255, (int) (Y + (1.732446 * (U-128)))));*/
+    //int color = Color.argb(255,Y,Y,Y);
+
+                    /*Bitmap prevBitmap = Bitmap.createBitmap(prevColors,width, height, Bitmap.Config.ARGB_8888);
+                FileOutputStream output = null;
+                try {
+                    output = new FileOutputStream(fileArray.get(numPictures-1));
+                    prevBitmap.compress(Bitmap.CompressFormat.JPEG, 50, output);
+                } catch (FileNotFoundException e) {
+                    e.printStackTrace();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                } finally {
+                    if (null != output) {
+                        try {
+                            output.close();
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                }*/
+
+            /*numPictures++;
+            File nextFile = new File(Environment.getExternalStorageDirectory().getPath() + "/Pictures/", "pic" + numPictures + ".jpg");
+            fileArray.add(nextFile);
+            Bitmap currBitmap = Bitmap.createBitmap(colorsCurr,width, height, Bitmap.Config.ARGB_8888);
+            FileOutputStream output2 = null;
+            try {
+                output2 = new FileOutputStream(nextFile);
+                currBitmap.compress(Bitmap.CompressFormat.JPEG, 50, output2);
+            } catch (FileNotFoundException e) {
+                e.printStackTrace();
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                if (null != output2) {
+                    try {
+                        output2.close();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+            currBitmap.recycle();*/
+
+}
